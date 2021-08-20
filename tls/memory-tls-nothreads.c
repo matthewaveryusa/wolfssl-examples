@@ -25,105 +25,99 @@
  gcc -Wall memory-tls.c  -l wolfssl -lpthread
 
 */
-
+#define MAX_RECORD_SIZE 4096
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <unistd.h>
 
+typedef struct {
+
 /* client messages to server in memory */
+WOLFSSL_CTX* cli_ctx;
 unsigned char to_server[1024*17];
 int server_bytes;
 int server_write_idx;
 int server_read_idx;
-pthread_mutex_t server_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  server_cond  = PTHREAD_COND_INITIALIZER;
 
 /* server messages to client in memory */
+WOLFSSL_CTX* srv_ctx;
 unsigned char to_client[1024*17];
 int client_bytes;
 int client_write_idx;
 int client_read_idx;
-pthread_mutex_t client_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t  client_cond  = PTHREAD_COND_INITIALIZER;
+} ctx_t;
 
 
 /* server send callback */
-int ServerSend(WOLFSSL* ssl, char* buf, int sz, void* ctx)
+int ServerSend(WOLFSSL* ssl, char* buf, int sz, ctx_t* ctx)
 {
-    pthread_mutex_lock(&client_mutex);
-
-    memcpy(&to_client[client_write_idx], buf, sz);
-    client_write_idx += sz;
-    client_bytes += sz;
-
-    pthread_cond_signal(&client_cond);
-    pthread_mutex_unlock(&client_mutex);
+    //printf("wolfSSL ServerSend, %d\n", sz);
+    memcpy(&ctx->to_client[ctx->client_write_idx], buf, sz);
+    ctx->client_write_idx += sz;
+    ctx->client_bytes += sz;
 
     return sz;
 }
 
 
 /* server recv callback */
-int ServerRecv(WOLFSSL* ssl, char* buf, int sz, void* ctx)
+int ServerRecv(WOLFSSL* ssl, char* buf, int sz, ctx_t* ctx)
 {
-    pthread_mutex_lock(&server_mutex);
+    //printf("wolfSSL ServerRecv, %d\n", sz);
+    if(ctx->server_bytes < sz) {
+      sz = ctx->server_bytes;
+    }
+    if(sz == 0) {
+      return WOLFSSL_CBIO_ERR_WANT_READ;
+    }
+    memcpy(buf, &ctx->to_server[ctx->server_read_idx], sz);
+    ctx->server_read_idx += sz;
 
-    while (server_bytes - server_read_idx < sz)
-        pthread_cond_wait(&server_cond, &server_mutex);
-
-    memcpy(buf, &to_server[server_read_idx], sz);
-    server_read_idx += sz;
-
-    if (server_read_idx == server_write_idx) {
-        server_read_idx = server_write_idx = 0;
-        server_bytes = 0;
+    if (ctx->server_read_idx == ctx->server_write_idx) {
+        ctx->server_read_idx = ctx->server_write_idx = 0;
+        ctx->server_bytes = 0;
     }
 
-    pthread_mutex_unlock(&server_mutex);
 
     return sz;
 }
 
 
 /* client send callback */
-int ClientSend(WOLFSSL* ssl, char* buf, int sz, void* ctx)
+int ClientSend(WOLFSSL* ssl, char* buf, int sz, ctx_t* ctx)
 {
-    pthread_mutex_lock(&server_mutex);
 
-    memcpy(&to_server[server_write_idx], buf, sz);
-    server_write_idx += sz;
-    server_bytes += sz;
-
-    pthread_cond_signal(&server_cond);
-    pthread_mutex_unlock(&server_mutex);
+    //printf("wolfSSL ClientSend, %d\n", sz);
+    memcpy(&ctx->to_server[ctx->server_write_idx], buf, sz);
+    ctx->server_write_idx += sz;
+    ctx->server_bytes += sz;
 
     return sz;
 }
 
 
 /* client recv callback */
-int ClientRecv(WOLFSSL* ssl, char* buf, int sz, void* ctx)
+int ClientRecv(WOLFSSL* ssl, char* buf, int sz, ctx_t* ctx)
 {
-    pthread_mutex_lock(&client_mutex);
-
-    while (client_bytes - client_read_idx < sz)
-        pthread_cond_wait(&client_cond, &client_mutex);
-
-    memcpy(buf, &to_client[client_read_idx], sz);
-    client_read_idx += sz;
-
-    if (client_read_idx == client_write_idx) {
-        client_read_idx = client_write_idx = 0;
-        client_bytes = 0;
+    //printf("wolfSSL ClientRecv, %d\n", sz);
+    if(ctx->client_bytes < sz) {
+      sz = ctx->client_bytes;
+    }
+    if(sz == 0) {
+      return WOLFSSL_CBIO_ERR_WANT_READ;
     }
 
-    pthread_mutex_unlock(&client_mutex);
+    memcpy(buf, &ctx->to_client[ctx->client_read_idx], sz);
+    ctx->client_read_idx += sz;
 
+    if (ctx->client_read_idx == ctx->client_write_idx) {
+        ctx->client_read_idx = ctx->client_write_idx = 0;
+        ctx->client_bytes = 0;
+    }
     return sz;
 }
 
@@ -135,76 +129,115 @@ static void err_sys(const char* msg)
 }
 
 
-#define key "../certs/server-key.pem"
-#define cert "../certs/server-cert.pem"
-#define cacert "../certs/ca-cert.pem"
-
-
-static void* client_thread(void* args)
-{
-    /* set up client */
-    WOLFSSL_CTX* cli_ctx = wolfSSL_CTX_new(wolfTLSv1_2_client_method());
-    if (cli_ctx == NULL) err_sys("bad client ctx new");
-
-    int ret = wolfSSL_CTX_load_verify_locations(cli_ctx, cacert, NULL);
-    if (ret != SSL_SUCCESS) err_sys("bad ca load");
-
-    wolfSSL_SetIOSend(cli_ctx, ClientSend);
-    wolfSSL_SetIORecv(cli_ctx, ClientRecv);
-
-    WOLFSSL* cli_ssl = wolfSSL_new(cli_ctx);
-    if (cli_ctx == NULL) err_sys("bad client new");
-
-    ret = wolfSSL_connect(cli_ssl);
-    if (ret != SSL_SUCCESS) err_sys("bad client tls connect");
-    printf("wolfSSL client success!\n");
-
-    ret = wolfSSL_write(cli_ssl, "hello memory wolfSSL!", 21);
-
-    /* clean up */
-    wolfSSL_free(cli_ssl);
-    wolfSSL_CTX_free(cli_ctx);
-
-    return NULL;
-}
-
+#define key "../certs/ecc-key.pem"
+#define cert "../certs/server-ecc.pem"
+#define cacert "../certs/ca-ecc-cert.pem"
 
 int main()
 {
-    /* set up server */
-    WOLFSSL_CTX* srv_ctx = wolfSSL_CTX_new(wolfTLSv1_2_server_method());
-    if (srv_ctx == NULL) err_sys("bad server ctx new");
 
-    int ret = wolfSSL_CTX_use_PrivateKey_file(srv_ctx, key, SSL_FILETYPE_PEM);
+    ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    /* set up server */
+    ctx.srv_ctx = wolfSSL_CTX_new(wolfTLSv1_3_server_method());
+    if (ctx.srv_ctx == NULL) err_sys("bad server ctx new");
+    //wolfSSL_CTX_set_session_cache_mode(ctx.srv_ctx, SSL_SESS_CACHE_OFF);
+
+    int ret = wolfSSL_CTX_use_PrivateKey_file(ctx.srv_ctx, key, SSL_FILETYPE_PEM);
     if (ret != SSL_SUCCESS) err_sys("bad server key file load");
 
-    ret = wolfSSL_CTX_use_certificate_file(srv_ctx, cert, SSL_FILETYPE_PEM);
+    ret = wolfSSL_CTX_use_certificate_file(ctx.srv_ctx, cert, SSL_FILETYPE_PEM);
     if (ret != SSL_SUCCESS) err_sys("bad server cert file load");
 
-    wolfSSL_SetIOSend(srv_ctx, ServerSend);
-    wolfSSL_SetIORecv(srv_ctx, ServerRecv);
+    wolfSSL_SetIOSend(ctx.srv_ctx, (CallbackIOSend) ServerSend);
+    wolfSSL_SetIORecv(ctx.srv_ctx, (CallbackIORecv) ServerRecv);
 
-    WOLFSSL* srv_ssl = wolfSSL_new(srv_ctx);
-    if (srv_ctx == NULL) err_sys("bad server new");
+    /* set up client */
+    ctx.cli_ctx = wolfSSL_CTX_new(wolfTLSv1_3_client_method());
+    if (ctx.cli_ctx == NULL) err_sys("bad client ctx new");
+    //wolfSSL_CTX_set_session_cache_mode(ctx.cli_ctx, SSL_SESS_CACHE_OFF);
+    //wolfSSL_CTX_UseMaxFragment(ctx.cli_ctx, WOLFSSL_MFL_2_11);
 
-    /* start client thread */
-    pthread_t tid;
-    pthread_create(&tid, 0, client_thread, NULL);
+    ret = wolfSSL_CTX_load_verify_locations(ctx.cli_ctx, cacert, NULL);
+    if (ret != SSL_SUCCESS) err_sys("bad ca load");
 
-    /* accept tls connection without tcp sockets */
-    ret = wolfSSL_accept(srv_ssl);
-    if (ret != SSL_SUCCESS) err_sys("bad server tls accept");
-    printf("wolfSSL accept success!\n");
+    wolfSSL_SetIOSend(ctx.cli_ctx, (CallbackIOSend) ClientSend);
+    wolfSSL_SetIORecv(ctx.cli_ctx, (CallbackIORecv) ClientRecv);
 
-    /* read msg post handshake from client */
-    unsigned char buf[80];
+    char *x = malloc(4096);
+    wolfSSL_get_ciphers(x,4096);
+    printf("enabled ciphers: %s\n", x);
+    memset(x, '@', 4096);
+    x[4095] = '\0';
+    
+    unsigned char buf[4096];
     memset(buf, 0, sizeof(buf));
-    ret = wolfSSL_read(srv_ssl, buf, sizeof(buf)-1);
-    printf("client msg = %s\n", buf);
 
-    /* clean up */
-    wolfSSL_free(srv_ssl);
-    wolfSSL_CTX_free(srv_ctx);
+
+    for(int i = 0; i < 100000; ++i) {
+
+    WOLFSSL* cli_ssl = wolfSSL_new(ctx.cli_ctx);
+    wolfSSL_SetIOReadCtx(cli_ssl, &ctx);
+    wolfSSL_SetIOWriteCtx(cli_ssl, &ctx);
+    if (cli_ssl == NULL) err_sys("bad client new");
+
+    WOLFSSL* srv_ssl = wolfSSL_new(ctx.srv_ctx);
+    if (ctx.srv_ctx == NULL) err_sys("bad server new");
+    wolfSSL_SetIOReadCtx(srv_ssl, &ctx);
+    wolfSSL_SetIOWriteCtx(srv_ssl, &ctx);
+
+    int is_client_turn = 1;
+    int client_done = 0;
+    int server_done = 0;
+    while(1) {
+        if(is_client_turn) {
+          ret = wolfSSL_connect(cli_ssl); //send client hello
+        } else {
+          ret = wolfSSL_accept(srv_ssl); //send client hello
+        }
+
+        if (ret != SSL_SUCCESS) {
+          int err = wolfSSL_get_error(cli_ssl, 0);
+          if(err == WOLFSSL_ERROR_WANT_READ) {
+              is_client_turn = is_client_turn ? 0 : 1;
+          } else {
+            char buffer[4096];
+            wolfSSL_ERR_error_string(err, buffer);
+            printf("err = %d, %d, %s\n", err, ret, buffer);
+            err_sys("bad tls connect");
+          }
+        } else {
+            if(is_client_turn) {
+                client_done = 1;
+                is_client_turn = 0;
+            } else {
+                server_done = 1;
+                is_client_turn = 1;
+            }
+            if(client_done && server_done) {
+                break;
+            }
+        }
+    }
+    printf("%d wolfSSL client success!\n", i);
+    
+    ret = wolfSSL_write(cli_ssl, x, 4096);
+    ret = wolfSSL_read(srv_ssl, buf, 4096);
+    //printf("client msg = %s\n", buf);
+
+    /* keep connection open */
+    //wolfSSL_free(srv_ssl);
+    wolfSSL_free(cli_ssl);
+    //reset buffers:
+    ctx.client_read_idx = 0;
+    ctx.server_read_idx = 0;
+    ctx.server_write_idx = 0;
+    ctx.client_write_idx = 0;
+    ctx.server_bytes = 0;
+    ctx.client_bytes = 0;
+    }
+    wolfSSL_CTX_free(ctx.cli_ctx);
+    wolfSSL_CTX_free(ctx.srv_ctx);
 
     return 0;
 }
